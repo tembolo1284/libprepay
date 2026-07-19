@@ -1,31 +1,52 @@
-# Configured only when PREPAY_BUILD_PYTHON=ON (set by pyproject/scikit-build-core).
+cmake_minimum_required(VERSION 3.20)
+project(prepay VERSION 0.1.0 LANGUAGES CXX)
 
-find_package(Python 3.9 REQUIRED
-  COMPONENTS Interpreter Development.Module
-  OPTIONAL_COMPONENTS Development.SABIModule)
+option(PREPAY_BUILD_PYTHON "Build the nanobind Python extension" OFF)
+option(PREPAY_BUILD_TESTS  "Build native (CTest) tests"          OFF)
 
-# Locate the nanobind CMake package that ships inside the pip/conda install.
-execute_process(
-  COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
-  OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE nanobind_ROOT)
-find_package(nanobind CONFIG REQUIRED)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-# The compiled extension. Underscore-prefixed; the pure-Python prepay/__init__.py
-# re-exports a clean API on top of it.
-nanobind_add_module(_prepay
-  STABLE_ABI          # single wheel for CPython 3.12+
-  NB_STATIC           # fold libnanobind into the extension
-  ext.cpp
+# Export nothing by default; only the prepay_* C ABI carries
+# visibility("default") via PREPAY_BUILD_SHARED in the public header. This
+# keeps std:: and internal prepay::* symbols out of the dynamic table.
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+add_library(prepay SHARED
+  src/prepay_abi.cpp
+  src/prepay_version.cpp
+  src/prepay_error.cpp
+  src/model.cpp
+  src/engine.cpp
 )
 
-# Bind against the C ABI target from the top-level CMakeLists.
-target_link_libraries(_prepay PRIVATE prepay)
+target_include_directories(prepay
+  PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+          $<INSTALL_INTERFACE:include>
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
 
-# So the extension finds libprepay.so sitting next to it in the installed package.
-set_target_properties(_prepay PROPERTIES INSTALL_RPATH "$ORIGIN")
+# Marks the prepay_* entry points for export in the public header.
+target_compile_definitions(prepay PRIVATE PREPAY_BUILD_SHARED)
 
-# Everything lands under prepay/ in the wheel: the extension, the shared lib,
-# and the pure-Python package files.
-install(TARGETS _prepay LIBRARY DESTINATION prepay)
-install(TARGETS prepay  LIBRARY DESTINATION prepay)
-install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/prepay/ DESTINATION prepay)
+set_target_properties(prepay PROPERTIES
+  VERSION   ${PROJECT_VERSION}
+  SOVERSION ${PROJECT_VERSION_MAJOR}
+)
+
+if(PREPAY_BUILD_PYTHON)
+  add_subdirectory(python)
+endif()
+
+# tests/ currently holds smoke.c and the pytest suite, driven by build.sh
+# rather than CTest. Only descend if a CMakeLists is actually there.
+if(PREPAY_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
+  enable_testing()
+  add_subdirectory(tests)
+endif()

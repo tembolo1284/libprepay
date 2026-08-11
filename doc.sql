@@ -1,30 +1,32 @@
 /* =====================================================================
-   DW_MBS.sql
+   DW_MBS.sql   (5-block version)
    ---------------------------------------------------------------------
    Rebuilds the MBS-family voice-trade dataset from the RAW tables,
    replacing a query against IDB_Reporting.dbo.IDB_DEAL_VOICE (being
-   decommissioned). Logic lifted from stored proc
-   IDB_Reporting.dbo.LoadVoiceTradeData.
+   decommissioned). Logic lifted from IDB_Reporting.dbo.LoadVoiceTradeData.
 
-   Covers four product groups, each from BOTH department blocks so no
-   records are dropped:
-       SPECIFIED  (SpecDb)      - HF (Division 100) + RC (Division 200)
-       ARMS       (ArmDb)       - HF + RC
-       CMO        (CmoDb)       - HF + RC
-       MBS-Rttm   (MbsDbRttm)   - HF + RC
+   BLOCKS (5, not 8):
+     1. SPECIFIED  HF   (SpecDb, Division 100)   \_ Specified keeps BOTH
+     2. SPECIFIED  RC   (SpecDb, Division 200)   /  department blocks
+     3. ARMS            (ArmDb)        - single block (HF logic)
+     4. CMO             (CmoDb)        - single block; SubDept = productgroup
+     5. MBS-Rttm        (MbsDbRttm)    - single block (HF logic)
 
-   Dealer is resolved per section as:
-       Dealer      = <detail>.CustNo      (raw source dealer number)
-       DealerName  = <customer>.CustName  (via Customer join)
-   and MasterDealerCode is stamped at the end from IDB_DEALER_MASTER,
-   scoped by each row's own Department (matches proc lines 1403-1407).
+   The HF/RC split only produces distinct rows for SPECIFIED. Running
+   both blocks for ARMS / CMO / MBS double-counted, so those are ONE
+   block each now.
 
-   NO product-group / dealer / department filtering: everything in the
-   window lands in #COMBINED.
+   BILLING CONVENTION: rate = 1, so dealer_commission IS the gross fee.
+   The final SELECT outputs  dealer_commission AS quantity.
 
-   Thin field set only (trade id, keys, cusip, dealer, name, master
-   code, qty, price, dates, type, trader). Commission / shared-account
-   columns intentionally omitted for now.
+   >>> VERIFY BEFORE PRODUCTION - these become the invoice with rate=1:
+       - Spec / ARM dealer_commission -> D.DealerCommission  (if this
+         column doesn't exist you'll get Msg 207; the detail table may
+         name it CustCommissions or BrokerCommission - swap accordingly)
+       - CMO dealer_commission -> T.BrokerCommissions  (CmoTradesDetails
+         also has CustCommissions - confirm which is the billable one)
+       - MBS dealer_commission -> T.Commissions  (confirmed present on
+         MbsTrades)
    ===================================================================== */
 
 SET NOCOUNT ON;
@@ -36,46 +38,46 @@ SET @tradedate1 = '20241201';
 SET @tradedate2 = '20241231';
 
 /* ---------------------------------------------------------------------
-   Common staging table. Every INSERT projects onto exactly these
-   columns; a source that lacks a field pads it with a typed NULL.
+   Common staging table.
    --------------------------------------------------------------------- */
 IF OBJECT_ID('tempdb..#COMBINED') IS NOT NULL DROP TABLE #COMBINED;
 CREATE TABLE #COMBINED
 (
-    source_tag       varchar(16)   NULL,   -- 'SPEC-HF', 'ARM-RC', etc.  (our tag)
-    department       varchar(5)    NULL,   -- 'HF' / 'RC'  (drives master-code join)
-    productgroup     varchar(20)   NULL,   -- 'SPECIFIED' / 'ARMS' / 'CMO' / 'MBS'
-    trade_id         varchar(60)   NULL,
+    source_tag        varchar(16)   NULL,   -- 'SPEC-HF', 'ARMS', SubDept for CMO, etc.
+    department        varchar(5)    NULL,   -- 'HF' / 'RC'  (drives master-code join)
+    productgroup      varchar(20)   NULL,   -- 'SPECIFIED' / 'ARMS' / ABS|CORP|CMBS|CMO / 'MBS'
+    trade_id          varchar(60)   NULL,
     deal_negotiation_id varchar(30) NULL,
-    TradeKey         nchar(12)     NULL,
-    TradeGroupKey    nchar(14)     NULL,
-    TradeDetailsKey  nvarchar(16)  NULL,
-    Cusip            varchar(50)   NULL,
-    SecurityDesc     varchar(255)  NULL,
-    tradedate        datetime      NULL,
-    buysell          varchar(5)    NULL,
-    quantity_orig    decimal(20,6) NULL,
-    tradeprice       varchar(30)   NULL,
-    tw_tradetype     varchar(25)   NULL,
-    tradetype2       varchar(25)   NULL,
-    isaggressor      char(1)       NULL,
-    legtype          varchar(20)   NULL,
-    sectype          nvarchar(4)   NULL,
-    trader           varchar(50)   NULL,
-    dealer           varchar(100)  NULL,   -- CustNo (source dealer number)
-    dealer_name      varchar(255)  NULL,   -- CustName
-    master_dealer_code varchar(10) NULL    -- filled by UPDATE at the end
+    TradeKey          nchar(12)     NULL,
+    TradeGroupKey     nchar(14)     NULL,
+    TradeDetailsKey   nvarchar(16)  NULL,
+    Cusip             varchar(50)   NULL,
+    SecurityDesc      varchar(255)  NULL,
+    tradedate         datetime      NULL,
+    buysell           varchar(5)    NULL,
+    quantity_orig     decimal(20,6) NULL,   -- face/par or factored current, per source
+    tradeprice        varchar(30)   NULL,
+    tw_tradetype      varchar(25)   NULL,
+    tradetype2        varchar(25)   NULL,
+    isaggressor       char(1)       NULL,
+    legtype           varchar(20)   NULL,
+    sectype           nvarchar(4)   NULL,
+    trader            varchar(50)   NULL,
+    dealer            varchar(100)  NULL,   -- CustNo (source dealer number)
+    dealer_name       varchar(255)  NULL,   -- CustName
+    dealer_commission float         NULL,   -- rate=1 => this is the gross fee
+    master_dealer_code varchar(10)  NULL    -- filled by UPDATE at the end
 );
 
 /* =====================================================================
    1. SPECIFIED  -  HF block   (SpecDb, Division 100)
-   proc ref: lines 443-589
    ===================================================================== */
 INSERT INTO #COMBINED
     (source_tag, department, productgroup, trade_id, deal_negotiation_id,
      TradeKey, TradeGroupKey, TradeDetailsKey, Cusip, SecurityDesc,
      tradedate, buysell, quantity_orig, tradeprice, tw_tradetype,
-     tradetype2, isaggressor, legtype, sectype, trader, dealer, dealer_name)
+     tradetype2, isaggressor, legtype, sectype, trader, dealer,
+     dealer_name, dealer_commission)
 SELECT
     'SPEC-HF',
     'HF',
@@ -102,17 +104,18 @@ SELECT
     SecType      = C.SecType,
     TraderName   = abr.TraderName,
     Dealer       = D.CustNo,
-    DealerName   = cu.CustName
-FROM SpecDb.dbo.SpecifiedTrades B (NOLOCK)
-    INNER JOIN SpecDb.dbo.SpecifiedTradesGroup C (NOLOCK)
+    DealerName   = cu.CustName,
+    DealerCommission = D.DealerCommission          -- <<< VERIFY column
+FROM IDBREPORTS2.SpecDb.dbo.SpecifiedTrades B (NOLOCK)
+    INNER JOIN IDBREPORTS2.SpecDb.dbo.SpecifiedTradesGroup C (NOLOCK)
         ON B.TradeKey = C.TradeKey
-    INNER JOIN SpecDb.dbo.SpecifiedTradesDetails D (NOLOCK)
+    INNER JOIN IDBREPORTS2.SpecDb.dbo.SpecifiedTradesDetails D (NOLOCK)
         ON C.TradeGroupKey = D.TradeGroupKey
-    LEFT JOIN SpecDb.dbo.SpecifiedTradesPools P (NOLOCK)
+    LEFT JOIN IDBREPORTS2.SpecDb.dbo.SpecifiedTradesPools P (NOLOCK)
         ON D.TradeDetailsKey = P.TradeDetailsKey
-    LEFT JOIN ArmSpecifiedDb..Customer cu (NOLOCK)
+    LEFT JOIN IDBREPORTS2.ArmSpecifiedDb.dbo.Customer cu (NOLOCK)
         ON D.CustNo = cu.CustNo
-    LEFT JOIN ArmSpecifiedDb.dbo.Broker abr (NOLOCK)
+    LEFT JOIN IDBREPORTS2.ArmSpecifiedDb.dbo.Broker abr (NOLOCK)
         ON D.AcctNo = abr.AcctNo
 WHERE B.TradeDate BETWEEN @tradedate1 AND @tradedate2
   AND B.Division = 100        /* HF */
@@ -120,13 +123,13 @@ WHERE B.TradeDate BETWEEN @tradedate1 AND @tradedate2
 
 /* =====================================================================
    2. SPECIFIED  -  RC block   (SpecDb, Division 200)
-   proc ref: lines 1271-1389
    ===================================================================== */
 INSERT INTO #COMBINED
     (source_tag, department, productgroup, trade_id, deal_negotiation_id,
      TradeKey, TradeGroupKey, TradeDetailsKey, Cusip, SecurityDesc,
      tradedate, buysell, quantity_orig, tradeprice, tw_tradetype,
-     tradetype2, isaggressor, legtype, sectype, trader, dealer, dealer_name)
+     tradetype2, isaggressor, legtype, sectype, trader, dealer,
+     dealer_name, dealer_commission)
 SELECT
     'SPEC-RC',
     'RC',
@@ -155,17 +158,18 @@ SELECT
     SecType      = C.SecType,
     TraderName   = abr.TraderName,
     Dealer       = D.CustNo,
-    DealerName   = cu.CustName
-FROM SpecDb.dbo.SpecifiedTrades B (NOLOCK)
-    INNER JOIN SpecDb.dbo.SpecifiedTradesGroup C (NOLOCK)
+    DealerName   = cu.CustName,
+    DealerCommission = D.DealerCommission          -- <<< VERIFY column
+FROM IDBREPORTS2.SpecDb.dbo.SpecifiedTrades B (NOLOCK)
+    INNER JOIN IDBREPORTS2.SpecDb.dbo.SpecifiedTradesGroup C (NOLOCK)
         ON B.TradeKey = C.TradeKey
-    INNER JOIN SpecDb.dbo.SpecifiedTradesDetails D (NOLOCK)
+    INNER JOIN IDBREPORTS2.SpecDb.dbo.SpecifiedTradesDetails D (NOLOCK)
         ON C.TradeGroupKey = D.TradeGroupKey
-    LEFT JOIN ArmSpecifiedDb..Customer cu (NOLOCK)
+    LEFT JOIN IDBREPORTS2.ArmSpecifiedDb.dbo.Customer cu (NOLOCK)
         ON D.CustNo = cu.CustNo
-    LEFT JOIN ArmSpecifiedDb.dbo.Broker abr (NOLOCK)
+    LEFT JOIN IDBREPORTS2.ArmSpecifiedDb.dbo.Broker abr (NOLOCK)
         ON D.AcctNo = abr.AcctNo
-    LEFT JOIN IDB_Reporting.dbo.IDB_HF_SharedAccounts sa
+    LEFT JOIN IDBREPORTS2.IDB_Reporting.dbo.IDB_HF_SharedAccounts sa
         ON abr.AcctNo COLLATE DATABASE_DEFAULT = sa.SharedAcctNo_HF COLLATE DATABASE_DEFAULT
        AND CONVERT(varchar(8), B.TradeDate, 112)
                BETWEEN sa.EffectiveStartDate AND sa.EffectiveEndDate
@@ -175,17 +179,18 @@ WHERE B.TradeDate BETWEEN @tradedate1 AND @tradedate2
   AND abr.BrokerName <> 'BALORD';
 
 /* =====================================================================
-   3. ARMS  -  HF block   (ArmDb)
-   proc ref: lines 343-440
+   3. ARMS   (ArmDb)   - single block
    ===================================================================== */
 INSERT INTO #COMBINED
     (source_tag, department, productgroup, trade_id, deal_negotiation_id,
      TradeKey, TradeGroupKey, TradeDetailsKey, Cusip, SecurityDesc,
      tradedate, buysell, quantity_orig, tradeprice, tw_tradetype,
-     tradetype2, isaggressor, legtype, sectype, trader, dealer, dealer_name)
+     tradetype2, isaggressor, legtype, sectype, trader, dealer,
+     dealer_name, dealer_commission)
 SELECT
-    'ARM-HF',
-    'HF',
+    'ARMS',
+    'HF',                                  -- single block; department not
+                                           -- critical for ARMS (see notes)
     'ARMS',
     CAST(B.TradeNo AS varchar(50)) + D.BorS,
     B.TradeNo,
@@ -193,7 +198,7 @@ SELECT
     C.TradeGroupKey,
     D.TradeDetailsKey,
     Cusip = (SELECT MAX(stp.PoolCusipNo)
-             FROM ArmDb.dbo.ArmTradesPools stp (NOLOCK)
+             FROM IDBREPORTS2.ArmDb.dbo.ArmTradesPools stp (NOLOCK)
              WHERE stp.TradeDetailsKey = D.TradeDetailsKey),
     SecurityDesc = C.SecType + ' ' + CAST(C.Coupon AS varchar(15)),
     B.TradeDate,
@@ -207,108 +212,51 @@ SELECT
     SecType      = C.SecType,
     TraderName   = abr.TraderName,
     Dealer       = d.CustNo,
-    DealerName   = cu.CustName
-FROM ArmDb.dbo.ArmTrades B (NOLOCK)
-    INNER JOIN ArmDb.dbo.ArmTradesGroup C (NOLOCK)
+    DealerName   = cu.CustName,
+    DealerCommission = D.DealerCommission          -- <<< VERIFY column
+FROM IDBREPORTS2.ArmDb.dbo.ArmTrades B (NOLOCK)
+    INNER JOIN IDBREPORTS2.ArmDb.dbo.ArmTradesGroup C (NOLOCK)
         ON B.TradeKey = C.TradeKey
-    INNER JOIN ArmDb.dbo.ArmTradesDetails D (NOLOCK)
+    INNER JOIN IDBREPORTS2.ArmDb.dbo.ArmTradesDetails D (NOLOCK)
         ON C.TradeGroupKey = D.TradeGroupKey
-    LEFT JOIN ArmSpecifiedDb..Customer cu (NOLOCK)
+    LEFT JOIN IDBREPORTS2.ArmSpecifiedDb.dbo.Customer cu (NOLOCK)
         ON D.CustNo = cu.CustNo
-    LEFT JOIN ArmSpecifiedDb.dbo.Broker abr (NOLOCK)
+    LEFT JOIN IDBREPORTS2.ArmSpecifiedDb.dbo.Broker abr (NOLOCK)
         ON D.AcctNo = abr.AcctNo
     OUTER APPLY
     (
         SELECT PoolCurrentAmount = SUM(stp.PoolCurrentAmount),
                PoolPrincipal     = SUM(stp.PoolPrincipal),
                PoolInterest      = SUM(stp.PoolInterest)
-        FROM ArmDb.dbo.ArmTradesPools stp (NOLOCK)
+        FROM IDBREPORTS2.ArmDb.dbo.ArmTradesPools stp (NOLOCK)
         WHERE stp.TradeDetailsKey = D.TradeDetailsKey
     ) P
 WHERE B.TradeDate BETWEEN @tradedate1 AND @tradedate2
   AND D.BrokerName <> 'BALORD';
 
 /* =====================================================================
-   4. ARMS  -  RC block   (ArmDb)
-   Same raw tables; RC-side customer/shared-account resolution.
-   ===================================================================== */
-INSERT INTO #COMBINED
-    (source_tag, department, productgroup, trade_id, deal_negotiation_id,
-     TradeKey, TradeGroupKey, TradeDetailsKey, Cusip, SecurityDesc,
-     tradedate, buysell, quantity_orig, tradeprice, tw_tradetype,
-     tradetype2, isaggressor, legtype, sectype, trader, dealer, dealer_name)
-SELECT
-    'ARM-RC',
-    'RC',
-    'ARMS',
-    CAST(B.TradeNo AS varchar(50)) + D.BorS,
-    B.TradeNo,
-    B.TradeKey,
-    C.TradeGroupKey,
-    D.TradeDetailsKey,
-    Cusip = (SELECT MAX(stp.PoolCusipNo)
-             FROM ArmDb.dbo.ArmTradesPools stp (NOLOCK)
-             WHERE stp.TradeDetailsKey = D.TradeDetailsKey),
-    SecurityDesc = C.SecType + ' ' + CAST(C.Coupon AS varchar(15)),
-    B.TradeDate,
-    BorS = CASE D.BorS WHEN 'B' THEN 'S' WHEN 'S' THEN 'B' END,
-    Quantity = ISNULL(P.PoolCurrentAmount, OrigFaceAmount)
-               * CASE WHEN sa.Broker_ID_HF IS NOT NULL THEN 0 ELSE 1 END,
-    TradePrice = D.Price,
-    tw_tradetype = NULL,
-    tradetype2   = NULL,
-    IsAggressor  = CASE WHEN D.CustCommissions > 0 THEN 1 ELSE 0 END,
-    LegType      = NULL,
-    SecType      = C.SecType,
-    TraderName   = abr.TraderName,
-    Dealer       = d.CustNo,
-    DealerName   = cu.CustName
-FROM ArmDb.dbo.ArmTrades B (NOLOCK)
-    INNER JOIN ArmDb.dbo.ArmTradesGroup C (NOLOCK)
-        ON B.TradeKey = C.TradeKey
-    INNER JOIN ArmDb.dbo.ArmTradesDetails D (NOLOCK)
-        ON C.TradeGroupKey = D.TradeGroupKey
-    LEFT JOIN ArmSpecifiedDb..Customer cu (NOLOCK)
-        ON D.CustNo = cu.CustNo
-    LEFT JOIN ArmSpecifiedDb.dbo.Broker abr (NOLOCK)
-        ON D.AcctNo = abr.AcctNo
-    LEFT JOIN IDB_Reporting.dbo.IDB_HF_SharedAccounts sa
-        ON abr.AcctNo COLLATE DATABASE_DEFAULT = sa.SharedAcctNo_HF COLLATE DATABASE_DEFAULT
-       AND CONVERT(varchar(8), B.TradeDate, 112)
-               BETWEEN sa.EffectiveStartDate AND sa.EffectiveEndDate
-       AND sa.ProductGroup = 'ARMS'
-    OUTER APPLY
-    (
-        SELECT PoolCurrentAmount = SUM(stp.PoolCurrentAmount)
-        FROM ArmDb.dbo.ArmTradesPools stp (NOLOCK)
-        WHERE stp.TradeDetailsKey = D.TradeDetailsKey
-    ) P
-WHERE B.TradeDate BETWEEN @tradedate1 AND @tradedate2
-  AND D.BrokerName <> 'BALORD';
-
-/* =====================================================================
-   5. CMO  -  HF block   (CmoDb)
-   proc ref: lines 262-338
+   4. CMO   (CmoDb)   - single block
+   SubDept (ABS / CORP / CMBS / CMO) is the product group AND source_tag.
    Dealer is two hops: CmoTradesDetails.CustNo -> Broker.AcctNo
-                                             -> Customer.CustNo
+                                              -> Customer.CustNo
    ===================================================================== */
 INSERT INTO #COMBINED
     (source_tag, department, productgroup, trade_id, deal_negotiation_id,
      Cusip, SecurityDesc, tradedate, buysell, quantity_orig, tradeprice,
      tw_tradetype, tradetype2, isaggressor, legtype, sectype, trader,
-     dealer, dealer_name)
+     dealer, dealer_name, dealer_commission)
 SELECT
-    'CMO-HF',
-    'HF',
-    'CMO',
-    CAST(T.TradeNo AS varchar(50)) + D.BorS,
+    ISNULL(D.SubDept, 'CMO'),              -- source_tag = SubDept
+    'HF',                                  -- department not critical for CMO
+    ISNULL(D.SubDept, 'CMO'),              -- productgroup = SubDept
+    CAST(T.TradeNo AS varchar(50)) + T.BorS,
     T.TradePartNo,
     Cusip = D.CusipNo,
     SecurityDesc = ISNULL(CAST(ROUND(S.Coupon,5) AS varchar(15)), '') + ' '
                    + ISNULL(S.Issuer, ''),
     T.TradeDate,
-    BorS = CASE D.BorS WHEN 'B' THEN 'S' WHEN 'S' THEN 'B' END,
-    CurrentQuantity = Par * ISNULL(D.Factor, 1.0),
+    BorS = CASE T.BorS WHEN 'B' THEN 'S' WHEN 'S' THEN 'B' END,
+    CurrentQuantity = T.Par * ISNULL(D.Factor, 1.0),
     TradePrice = T.Price,
     tw_tradetype = 'OUTRIGHT',
     tradetype2   = 'OUTRIGHT',
@@ -317,82 +265,34 @@ SELECT
     SecType      = NULL,
     TraderName   = B.TraderName,
     Dealer       = B.CustNo,
-    DealerName   = C.CustName
-FROM CmoDb.dbo.CmoTradesDetails T (NOLOCK)
-    INNER JOIN CmoDb.dbo.CmoTrades D (NOLOCK)
+    DealerName   = C.CustName,
+    DealerCommission = T.BrokerCommissions         -- <<< VERIFY: Broker vs Cust
+FROM IDBREPORTS2.CmoDb.dbo.CmoTradesDetails T (NOLOCK)
+    INNER JOIN IDBREPORTS2.CmoDb.dbo.CmoTrades D (NOLOCK)
         ON T.TradeDate = D.TradeDate AND T.TradeNo = D.TradeNo
-    LEFT JOIN CmoDb.dbo.Broker B (NOLOCK)
+    LEFT JOIN IDBREPORTS2.CmoDb.dbo.Broker B (NOLOCK)
         ON T.CustNo = B.AcctNo
-    LEFT JOIN CmoDb.dbo.Customer C (NOLOCK)
+    LEFT JOIN IDBREPORTS2.CmoDb.dbo.Customer C (NOLOCK)
         ON B.CustNo = C.CustNo
-    LEFT JOIN CmoDb.dbo.Security S (NOLOCK)
+    LEFT JOIN IDBREPORTS2.CmoDb.dbo.Security S (NOLOCK)
         ON D.CusipNo = S.CusipNo
 WHERE T.TradeDate BETWEEN @tradedate1 AND @tradedate2;
 
 /* =====================================================================
-   6. CMO  -  RC block   (CmoDb)
-   Adds the IDB_HF_CMO_SPEC_Brokers (HFB) overlay + shared accounts.
-   ===================================================================== */
-INSERT INTO #COMBINED
-    (source_tag, department, productgroup, trade_id, deal_negotiation_id,
-     Cusip, SecurityDesc, tradedate, buysell, quantity_orig, tradeprice,
-     tw_tradetype, tradetype2, isaggressor, legtype, sectype, trader,
-     dealer, dealer_name)
-SELECT
-    'CMO-RC',
-    'RC',
-    'CMO',
-    CAST(T.TradeNo AS varchar(50)) + D.BorS,
-    T.TradePartNo,
-    Cusip = D.CusipNo,
-    SecurityDesc = ISNULL(CAST(ROUND(S.Coupon,5) AS varchar(15)), '') + ' '
-                   + ISNULL(S.Issuer, ''),
-    T.TradeDate,
-    BorS = CASE D.BorS WHEN 'B' THEN 'S' WHEN 'S' THEN 'B' END,
-    CurrentQuantity = Par * ISNULL(D.Factor, 1.0),
-    TradePrice = T.Price,
-    tw_tradetype = 'OUTRIGHT',
-    tradetype2   = 'OUTRIGHT',
-    IsAggressor  = CASE WHEN T.CustCommissions > 0 THEN 1 ELSE 0 END,
-    LegType      = HFB.Source,
-    SecType      = NULL,
-    TraderName   = B.TraderName,
-    Dealer       = B.CustNo,
-    DealerName   = C.CustName
-FROM CmoDb.dbo.CmoTradesDetails T (NOLOCK)
-    INNER JOIN CmoDb.dbo.CmoTrades D (NOLOCK)
-        ON T.TradeDate = D.TradeDate AND T.TradeNo = D.TradeNo
-    LEFT JOIN IDB_Reporting.dbo.IDB_HF_CMO_SPEC_Brokers HFB (NOLOCK)
-        ON T.BrokerName = HFB.BrokerName COLLATE SQL_Latin1_General_CP437_CI_AS
-       AND T.TradeDate BETWEEN HFB.EffectiveStartDate AND HFB.EffectiveEndDate
-    LEFT JOIN CmoDb.dbo.Broker B (NOLOCK)
-        ON T.CustNo = B.AcctNo
-    LEFT JOIN CmoDb.dbo.Customer C (NOLOCK)
-        ON B.CustNo = C.CustNo
-    LEFT JOIN CmoDb.dbo.Security S (NOLOCK)
-        ON D.CusipNo = S.CusipNo
-    LEFT JOIN IDB_Reporting.dbo.IDB_HF_SharedAccounts sa
-        ON B.AcctNo COLLATE DATABASE_DEFAULT = sa.SharedAcctNo_HF COLLATE DATABASE_DEFAULT
-       AND CONVERT(varchar(8), T.TradeDate, 112)
-               BETWEEN sa.EffectiveStartDate AND sa.EffectiveEndDate
-       AND sa.ProductGroup = D.SubDept COLLATE DATABASE_DEFAULT
-WHERE T.TradeDate BETWEEN @tradedate1 AND @tradedate2;
-
-/* =====================================================================
-   7. MBS-Rttm  -  HF block   (MbsDbRttm)
-   proc ref: lines 186-268
+   5. MBS-Rttm   (MbsDbRttm)   - single block
    Dealer: MbsccData.Cust -> Broker.BrokerAcct -> Customer.CustNo
+   fnTradeAggressorVoice inlined (functions not permitted).
    ===================================================================== */
 INSERT INTO #COMBINED
     (source_tag, department, productgroup, trade_id, deal_negotiation_id,
      Cusip, SecurityDesc, tradedate, buysell, quantity_orig, tradeprice,
      tw_tradetype, tradetype2, isaggressor, legtype, sectype, trader,
-     dealer, dealer_name)
+     dealer, dealer_name, dealer_commission)
 SELECT
-    'MBS-HF',
-    'HF',
     'MBS',
-    CAST(T.TradeNo AS varchar(50)) + CASE D.BorS WHEN 'B' THEN 'S' WHEN 'S' THEN 'B' END,
+    'HF',                                  -- department not critical for MBS
+    'MBS',
+    CAST(T.TradeNo AS varchar(50)) + D.BorS,
     T.TradeNo,
     Cusip = T.Cusip,
     SecurityDesc = T.Descriptor,
@@ -402,100 +302,47 @@ SELECT
     TradePrice = T.DollarSpread,
     tw_tradetype = 'OUTRIGHT',
     tradetype2   = 'OUTRIGHT',
-    IsAggressor  = IDB_Reporting.dbo.fnTradeAggressorVoice(T.Type, T.CommPayer, D.BorS),
+    IsAggressor  = CASE
+                     WHEN T.Type IN ('S1','R1','S3','R3','C') AND T.CommPayer <> D.BorS THEN 0
+                     WHEN T.Type IN ('S2','R2')              AND T.CommPayer =  D.BorS THEN 0
+                     ELSE 1
+                   END,
     LegType      = T.Type,
     SecType      = T.SecType,
     TraderName   = B.TraderName,
     Dealer       = B.CustNo,
-    DealerName   = C.CustName
-FROM MbsDbRttm..MbsTrades T (NOLOCK)
-    INNER JOIN MbsDbRttm..MbsccData D (NOLOCK)
+    DealerName   = C.CustName,
+    DealerCommission = T.Commissions               -- confirmed on MbsTrades
+FROM IDBREPORTS2.MbsDbRttm.dbo.MbsTrades T (NOLOCK)
+    INNER JOIN IDBREPORTS2.MbsDbRttm.dbo.MbsccData D (NOLOCK)
         ON T.TradeDate = D.TradeDate AND T.TradeNo = D.TradeNo
-    LEFT JOIN MbsDbRttm..Broker B (NOLOCK)
+    LEFT JOIN IDBREPORTS2.MbsDbRttm.dbo.Broker B (NOLOCK)
         ON D.Cust = B.BrokerAcct
-    LEFT JOIN MbsDbRttm..Customer C (NOLOCK)
+    LEFT JOIN IDBREPORTS2.MbsDbRttm.dbo.Customer C (NOLOCK)
         ON B.CustNo = C.CustNo
 WHERE T.TradeDate BETWEEN @tradedate1 AND @tradedate2;
 
 /* =====================================================================
-   8. MBS-Rttm  -  RC block   (MbsDbRttm)
-   proc ref: lines 1271-1391  (Division 200 / RC)
-   ===================================================================== */
-INSERT INTO #COMBINED
-    (source_tag, department, productgroup, trade_id, deal_negotiation_id,
-     TradeKey, TradeGroupKey, TradeDetailsKey, Cusip, SecurityDesc,
-     tradedate, buysell, quantity_orig, tradeprice, tw_tradetype,
-     tradetype2, isaggressor, legtype, sectype, trader, dealer, dealer_name)
-SELECT
-    'MBS-RC',
-    'RC',
-    'MBS',
-    CAST(B.TradeNo AS varchar(50)) + D.BorS,
-    B.TradeNo,
-    B.TradeKey,
-    C.TradeGroupKey,
-    D.TradeDetailsKey,
-    Cusip = C.CusipNo,
-    SecurityDesc = CASE WHEN ISNULL(C.TbaType,'') = '' AND D.FICCStatus = 'MULT'
-                        THEN ISNULL(sm.Description, C.SecType + ' ' + CAST(C.Coupon AS varchar(15)))
-                        ELSE C.SecType + ' ' + CAST(C.Coupon AS varchar(15)) END,
-    B.TradeDate,
-    BorS = CASE D.BorS WHEN 'B' THEN 'S' WHEN 'S' THEN 'B' END,
-    Quantity = ISNULL(C.OrigFaceAmount, 0)
-               * CASE WHEN sa.Broker_ID_HF IS NOT NULL THEN 0 ELSE 1 END,
-    TradePrice = D.Price,
-    tw_tradetype = CASE WHEN ISNULL(C.TbaType,'') = 'C' THEN 'OUTRIGHT'
-                        WHEN ISNULL(C.TbaType,'') IN ('S1','S2','S3') THEN 'BFLY'
-                        ELSE 'OUTRIGHT' END,
-    tradetype2   = CASE WHEN ISNULL(C.TbaType,'') = 'C' THEN 'OUTRIGHT'
-                        WHEN ISNULL(C.TbaType,'') IN ('S1','S2','S3') THEN 'BFLY'
-                        ELSE 'OUTRIGHT' END,
-    IsAggressor  = CASE WHEN C.CommissionPayer = D.BorS THEN 1
-                        WHEN C.CommissionPayer = 'T' THEN 1 ELSE 0 END,
-    LegType      = C.TbaType,
-    SecType      = C.SecType,
-    TraderName   = abr.TraderName,
-    Dealer       = d.CustNo,
-    DealerName   = cu.CustName
-FROM SpecDb.dbo.SpecifiedTrades B (NOLOCK)
-    INNER JOIN SpecDb.dbo.SpecifiedTradesGroup C (NOLOCK)
-        ON B.TradeKey = C.TradeKey
-    INNER JOIN SpecDb.dbo.SpecifiedTradesDetails D (NOLOCK)
-        ON C.TradeGroupKey = D.TradeGroupKey
-    LEFT JOIN Instrument..Security_Master sm (NOLOCK)
-        ON C.CusipNo COLLATE SQL_Latin1_General_CP437_CI_AS = sm.std_sec_id
-       AND sm.sec_id = (SELECT MIN(sec_id) FROM Instrument..Security_Master
-                        WHERE std_sec_id = C.CusipNo COLLATE SQL_Latin1_General_CP437_CI_AS)
-    LEFT JOIN ArmSpecifiedDb..Customer cu (NOLOCK)
-        ON d.CustNo = cu.CustNo
-    LEFT JOIN ArmSpecifiedDb.dbo.Broker abr (NOLOCK)
-        ON d.AcctNo = abr.AcctNo
-    LEFT JOIN IDB_Reporting.dbo.IDB_HF_SharedAccounts sa
-        ON d.AcctNo COLLATE DATABASE_DEFAULT = sa.SharedAcctNo_HF COLLATE DATABASE_DEFAULT
-       AND CONVERT(varchar(8), B.TradeDate, 112)
-               BETWEEN sa.EffectiveStartDate AND sa.EffectiveEndDate
-       AND sa.ProductGroup = 'SPECIFIED'
-WHERE B.TradeDate BETWEEN @tradedate1 AND @tradedate2
-  AND B.Division = 200        /* RC */
-  AND D.BrokerName <> 'BALORD';
-
-/* =====================================================================
    MASTER DEALER CODE
-   Stamp the canonical dealer code onto every row from its own
-   Department. Matches proc lines 1403-1407.
+   Stamp the canonical dealer code from each row's own Department.
+   For SPECIFIED this resolves HF vs RC correctly; for the single-block
+   products it uses the 'HF' literal above (see notes).
    ===================================================================== */
 UPDATE D
 SET D.master_dealer_code = S.MasterDealerCode
 FROM #COMBINED D
-JOIN IDB_Reporting.dbo.IDB_DEALER_MASTER S (NOLOCK)
+JOIN IDBREPORTS2.IDB_Reporting.dbo.IDB_DEALER_MASTER S (NOLOCK)
     ON D.dealer     = S.SourceDealerCode
    AND D.department = S.DealerSource;
 
 /* =====================================================================
    FINAL OUTPUT
+   rate = 1, so dealer_commission is surfaced AS quantity.
+   Optional dealer filter applied here (leave @dealer NULL for all).
    ===================================================================== */
-SELECT *
+SELECT dealer_commission AS quantity, *
 FROM #COMBINED
+WHERE (@dealer IS NULL OR @dealer = dealer)
 ORDER BY tradedate, dealer;
 
 IF OBJECT_ID('tempdb..#COMBINED') IS NOT NULL DROP TABLE #COMBINED;
